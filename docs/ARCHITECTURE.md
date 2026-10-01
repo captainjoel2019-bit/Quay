@@ -229,7 +229,7 @@ Every `CircuitBreakerOffRamp` call is instrumented (`anchor_calls_total`,
 consecutive failures, so a down anchor gets a 30s cooldown instead of being hit by every
 poll tick.
 
-### 4. Cash-out — SEP-24 interactive variant (not implemented — MAINTAINER.md roadmap item 1)
+### 4. Cash-out — SEP-24 interactive variant (per-anchor selection tracked in [#216](https://github.com/determined-001/Quay/issues/216); quote gaps in [#217](https://github.com/determined-001/Quay/issues/217)/[#219](https://github.com/determined-001/Quay/issues/219))
 
 ```mermaid
 sequenceDiagram
