@@ -16,10 +16,12 @@ import {
   TESTANCHOR_BASE_URL,
   TESTANCHOR_HOME_DOMAIN,
   TestAnchorKyc,
+  deleteSep12Customer,
   TestAnchorOffRamp,
 } from "@checkout/offramp";
 import type {
   KycPort,
+  AnchorCustomer,
   Logger,
   OffRampPort,
   OffRampStateRepository,
@@ -83,6 +85,7 @@ export interface Container {
   /** Sellers' own SEP-10 sessions with the anchor. Null when there is no real
    *  anchor (OFFRAMP=mock|none), so nothing to sign in to. */
   anchorAuth: SellerAnchorAuth | null;
+  deleteAnchorCustomer?: ((customer: AnchorCustomer) => Promise<"deleted" | "not_found">) | null;
   telemetry: OffRampTelemetryRepository;
   config: { network: string; horizonUrl: string; sellerWallet: string | null };
   horizonStatus(): HorizonStatus;
@@ -138,7 +141,14 @@ export async function createContainer(): Promise<Container> {
   });
 
   const { db, client } = createDb(env.databaseUrl, env.databaseAuthToken);
-  await bootstrap(client);
+  // A real anchor's home domain attributes pre-4.24 seller_kyc rows to it; with
+  // none configured they stay "legacy" and are never reused for a customer id.
+  await bootstrap(client, {
+    kycAnchorDomain:
+      env.offramp === "testanchor" || env.offramp === "anchor"
+        ? env.anchorHomeDomain ?? TESTANCHOR_HOME_DOMAIN
+        : null,
+  });
 
   const piiKey = env.kycEncryptionKey ? parsePiiKey(env.kycEncryptionKey) : null;
   if (!piiKey) {
@@ -230,6 +240,7 @@ export async function createContainer(): Promise<Container> {
     telemetry: telemetryRepo,
     health: anchorHealth,
     correlation: env.correlation,
+    interactiveTimeoutMs: env.offrampInteractiveTimeoutMs,
     logger,
   });
 
@@ -297,6 +308,11 @@ export async function createContainer(): Promise<Container> {
     kycConsents: kycConsentsRepo,
     anchorDomain,
     anchorAuth: anchor?.auth ?? null,
+    deleteAnchorCustomer: anchor ? async (customer) => {
+      const jwt = await anchor.auth.token(customer);
+      const { kycServer } = await anchor.discovery.get();
+      return deleteSep12Customer(kycServer, jwt, customer.account);
+    } : null,
     telemetry: telemetryRepo,
     config: { network: stellar.network, horizonUrl: stellar.horizonUrl, sellerWallet },
     horizonStatus: () => pollingWatcher.getStatus(),

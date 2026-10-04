@@ -55,6 +55,8 @@ export interface LinkDetail {
   link: PaymentLink;
   request: PaymentRequest;
   deliveries: WebhookDelivery[];
+  /** Raw upstream status from offramp_jobs.external_status (e.g. SEP-24 "incomplete"). Null when no job ran yet. */
+  offrampExternalStatus: string | null;
 }
 
 /** Fields exposed on the public receipt — never includes seller PII. */
@@ -85,6 +87,19 @@ export interface KycView {
   providedFields: Record<string, string>;
   message: string | null;
   lastSyncedAt: number | null;
+}
+
+/** Disclosure metadata only. Field values must never appear in this response. */
+export interface KycDisclosure {
+  anchorDomain: string;
+  status: KycStatus;
+  fields: Array<{
+    name: string;
+    sentAt: number;
+    anchorStatus: string;
+    error?: string | null;
+  }>;
+  consent: { grantedAt: number; revokedAt: number | null } | null;
 }
 
 // Browser calls go to NEXT_PUBLIC_API_URL; server-side calls fall back to API_URL.
@@ -167,6 +182,7 @@ export type ApiErrorCode =
   | "unreachable" // synthetic — fetch itself threw (DNS / network down)
   | "server_error" // 5xx or unexpected non-JSON response
   | "consent_required" // per-anchor consent missing for KYC fields
+  | "offramp_rejected" // anchor refused the amount/type; see `details.limits` and `details.availableTypes`
   // Operator telemetry (issue 5.21):
   | "unauthorized" // telemetry token rejected
   | "telemetry_not_enabled" // deployment has no TELEMETRY_TOKEN configured
@@ -188,6 +204,17 @@ export class CheckoutError extends Error {
   }
 }
 
+function describeOffRampRejected(err: CheckoutError): string {
+  const limits = (err.details.limits ?? {}) as { minAmount?: number; maxAmount?: number };
+  const { minAmount, maxAmount } = limits;
+  if (minAmount !== undefined && maxAmount !== undefined) {
+    return `The anchor only accepts cash-outs between ${minAmount} and ${maxAmount}. Adjust the amount and try again.`;
+  }
+  if (minAmount !== undefined) return `The anchor requires a cash-out of at least ${minAmount}.`;
+  if (maxAmount !== undefined) return `The anchor accepts cash-outs of at most ${maxAmount}.`;
+  return "The anchor can't process this cash-out as requested.";
+}
+
 /** Map an error code to copy suitable for a seller-facing dashboard. */
 export function describeError(err: CheckoutError): string {
   switch (err.code) {
@@ -199,6 +226,8 @@ export function describeError(err: CheckoutError): string {
       return "This action cannot be completed right now. The link may be in an unexpected state. Try refreshing.";
     case "kyc_required":
       return "Identity verification is required before you can cash out. See the panel above.";
+    case "offramp_rejected":
+      return describeOffRampRejected(err);
     case "anchor_auth_required":
       return "Sign in to the anchor with your wallet first. See the identity verification panel.";
     case "destination_cannot_receive":
@@ -255,8 +284,9 @@ export function setServerSkewForTest(ms: number): void {
 }
 
 async function http<T>(path: string, init?: RequestInit & { idempotencyKey?: string; raw?: boolean }): Promise<T> {
+  const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
   const headers: Record<string, string> = {
-    "content-type": "application/json",
+    ...(isFormData ? {} : { "content-type": "application/json" }),
     ...((init?.headers as Record<string, string> | undefined) ?? {}),
   };
   if (sessionToken) headers.authorization = `Bearer ${sessionToken}`;
@@ -312,6 +342,8 @@ async function http<T>(path: string, init?: RequestInit & { idempotencyKey?: str
                       ? "invalid_body"
                       : apiCode === "kyc_required"
                         ? "kyc_required"
+                        : apiCode === "offramp_rejected"
+                          ? "offramp_rejected"
                         : apiCode === "anchor_auth_required"
                           ? "anchor_auth_required"
                         : apiCode === "destination_cannot_receive"
@@ -457,6 +489,7 @@ export const api = {
     targetCurrency: string,
     payoutFields: Record<string, string> = {},
     idempotencyKey?: string,
+    quoteId?: string,
     withdrawType?: string,
   ) =>
     http<{
@@ -477,10 +510,16 @@ export const api = {
       `/links/${id}/cash-out`,
       {
         method: "POST",
-        body: JSON.stringify({ targetCurrency, payoutFields, ...(withdrawType ? { withdrawType } : {}) }),
+        body: JSON.stringify({
+          targetCurrency,
+          payoutFields,
+          ...(quoteId ? { quoteId } : {}),
+          ...(withdrawType ? { withdrawType } : {}),
+        }),
         idempotencyKey,
       },
     ),
+
 
   exportCsv: (from?: string, to?: string): Promise<Blob> => {
     const params = new URLSearchParams();
@@ -504,6 +543,10 @@ export const api = {
 
   logout: () => http<{ ok: true }>("/auth/logout", { method: "POST" }).finally(() => setSessionToken(null)),
   getKyc: () => http<KycView>("/seller/kyc"),
+  getDisclosures: () => http<KycDisclosure[]>("/seller/kyc/disclosures"),
+  deleteAnchorKyc: (anchorDomain: string) => http<{ anchorDomain: string; anchorResult: "deleted" | "not_found"; localDataErased: true }>(
+    `/seller/kyc/disclosures/${encodeURIComponent(anchorDomain)}`, { method: "DELETE" },
+  ),
 
   // The seller's own SEP-10 session with the anchor: getAnchorChallenge() ->
   // sign with the wallet -> completeAnchorAuth(). Quay never signs it.
@@ -546,6 +589,8 @@ export const api = {
 
   revokeKycConsent: (anchorDomain: string) =>
     http<{ revoked: boolean; anchorDomain: string; note: string }>(`/seller/kyc/consent/${encodeURIComponent(anchorDomain)}`, { method: "DELETE" }),
+  submitKycFiles: (formData: FormData) =>
+    http<KycView>("/seller/kyc/files", { method: "PUT", body: formData }),
 
   listWebhooks: () => http<{ webhooks: Webhook[] }>("/webhooks"),
 

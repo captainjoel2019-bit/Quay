@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const sellers = sqliteTable("sellers", {
   id: text("id").primaryKey(),
@@ -147,6 +147,12 @@ export const offrampQuotes = sqliteTable("offramp_quotes", {
   sellAmount: text("sell_amount").notNull(),
   buyCurrency: text("buy_currency").notNull(),
   price: text("price").notNull(),
+  // The figures shown to the seller at quote time; null on pre-existing rows.
+  quotedRate: text("quoted_rate"),
+  quotedTargetAmount: text("quoted_target_amount"),
+  quotedFeeAmount: text("quoted_fee_amount"),
+  quotedFeeSource: text("quoted_fee_source"),
+  quotedNetTargetAmount: text("quoted_net_target_amount"),
   expiresAt: integer("expires_at").notNull(),
   createdAt: integer("created_at").notNull(),
 });
@@ -176,8 +182,11 @@ export const offrampJobs = sqliteTable("offramp_jobs", {
 // Keyed by seller (never by link) — identity is submitted once and reused
 // across every link. `fieldsEncrypted` is the only PII column: an AES-256-GCM
 // blob of the seller's submitted field values, opaque without KYC_ENCRYPTION_KEY.
+// Primary key (seller_id, anchor_domain) comes from BOOTSTRAP_SQL, as for anchor_sessions.
 export const sellerKyc = sqliteTable("seller_kyc", {
-  sellerId: text("seller_id").primaryKey(),
+  sellerId: text("seller_id").notNull(),
+  // The anchor home domain this state belongs to; "legacy" for unattributable old rows.
+  anchorDomain: text("anchor_domain").notNull(),
   // The Stellar account `customer_id` belongs to at the anchor. Null on rows
   // written when every seller shared the platform's account.
   account: text("account"),
@@ -193,6 +202,16 @@ export const sellerKyc = sqliteTable("seller_kyc", {
   lastSyncedAt: integer("last_synced_at"),
   updatedAt: integer("updated_at").notNull(),
 });
+
+/** Last successful send of each field to an anchor. Contains names and times only. */
+export const kycDisclosureFields = sqliteTable("kyc_disclosure_fields", {
+  sellerId: text("seller_id").notNull(),
+  anchorDomain: text("anchor_domain").notNull(),
+  fieldName: text("field_name").notNull(),
+  sentAt: integer("sent_at").notNull(),
+}, (table) => [
+  uniqueIndex("kyc_disclosure_field_unique").on(table.sellerId, table.anchorDomain, table.fieldName),
+]);
 
 // A seller's SEP-10 session with an anchor, issued to the seller's own wallet.
 // `tokenEncrypted` is a bearer credential for that seller at the anchor — it

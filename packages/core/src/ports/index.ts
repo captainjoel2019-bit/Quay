@@ -173,7 +173,7 @@ export interface SellerPayoutRef {
   fields: Record<string, string>;
 }
 
-export type OffRampJobStatus = "pending" | "settled" | "failed";
+export type OffRampJobStatus = "awaiting_transfer" | "pending" | "settled" | "failed";
 
 export interface OffRampJob {
   jobId: string;
@@ -207,6 +207,25 @@ export class AnchorAuthRequiredError extends Error {
   constructor(readonly anchorDomain: string) {
     super(`No active session with anchor ${anchorDomain}; the seller must sign in to it with their wallet`);
     this.name = "AnchorAuthRequiredError";
+  }
+}
+
+/**
+ * The anchor refused the request because of what the caller asked for (an amount
+ * outside its published limits, an unsupported withdraw type), not because the
+ * anchor is unhealthy. The API maps it to `422 offramp_rejected` and it must not
+ * count towards the circuit breaker.
+ */
+export class OffRampRejectedError extends Error {
+  constructor(
+    message: string,
+    /** The anchor's published amount limits, when it named them. */
+    readonly limits: { minAmount?: number; maxAmount?: number } = {},
+    /** Withdraw types the anchor would accept, when relevant. */
+    readonly availableTypes: string[] = [],
+  ) {
+    super(message);
+    this.name = "OffRampRejectedError";
   }
 }
 
@@ -347,6 +366,18 @@ export interface StoredOffRampQuote {
   sellAmount: string;
   buyCurrency: string;
   price: string;
+  /** What the seller was shown at quote time. A later `quoteId` confirm replays
+   *  these verbatim — it must never recompute them, or the job would record
+   *  figures the seller never agreed to. Absent on rows saved before they were
+   *  persisted; those cannot be confirmed by id. */
+  quotedAmounts?: {
+    /** OffRampQuote.rate — target per source, which is not always `price`. */
+    rate: string;
+    targetAmount: string;
+    feeAmount: string;
+    feeSource: "anchor" | "estimated";
+    netTargetAmount: string;
+  };
   expiresAt: number;
   createdAt: number;
 }
@@ -458,6 +489,10 @@ export interface KycFieldSpec {
 
 export interface KycRecord {
   sellerId: string;
+  /** The anchor this record is about (its home domain). `customerId`, `status`
+   *  and `requiredFields` are that anchor's decision; `"legacy"` marks a row
+   *  that predates per-anchor keys and could not be attributed. */
+  anchorDomain: string;
   /** The Stellar account the anchor's customer record belongs to. A stored
    *  `customerId` is only reused while this still matches the seller's wallet;
    *  null on rows written when every seller shared the platform's account. */
@@ -498,6 +533,12 @@ export class KycRequiredError extends Error {
   }
 }
 
+export interface KycUploadFile {
+  name: string;
+  blob: Blob;
+  filename: string;
+}
+
 export interface KycPort {
   /** Refreshes from the anchor (if applicable) and persists the result.
    *  Throws {@link AnchorAuthRequiredError} without a live anchor session. */
@@ -505,20 +546,19 @@ export interface KycPort {
   /** Submits/updates fields. Throws {@link KycRequiredError} if a required
    *  field is still missing after merging with what's already on file. */
   submit(customer: AnchorCustomer, fields: Record<string, string>): Promise<KycRecord>;
+  /** Submits binary/file fields directly to the anchor via multipart/form-data.
+   *  Never persists binary file data. */
+  submitFiles(customer: AnchorCustomer, files: KycUploadFile[]): Promise<KycRecord>;
 }
 
-/** Persistence for `KycRecord`, keyed by seller. `providedFields` is PII and
- *  must be encrypted at rest by the implementation. */
+/** Persistence for `KycRecord`, keyed by (seller, anchor): SEP-12 state belongs
+ *  to one anchor, so two anchors never share or overwrite a record.
+ *  `providedFields` is PII and must be encrypted at rest by the implementation. */
 export interface KycRepository {
-  get(sellerId: string): Promise<KycRecord | null>;
+  get(sellerId: string, anchorDomain: string): Promise<KycRecord | null>;
   save(record: KycRecord): Promise<void>;
-}
-
-/** Persistence for `KycRecord`, keyed by seller. `providedFields` is PII and
- *  must be encrypted at rest by the implementation. */
-export interface KycRepository {
-  get(sellerId: string): Promise<KycRecord | null>;
-  save(record: KycRecord): Promise<void>;
+  /** Removes the seller's record for one anchor, or for every anchor when omitted. */
+  delete(sellerId: string, anchorDomain?: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

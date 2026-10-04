@@ -474,9 +474,13 @@ class FakeKycAlwaysAcceptedForAnchor implements KycPort {
   async submit(customer: AnchorCustomer): Promise<KycRecord> {
     return this.accepted(customer);
   }
+  async submitFiles(customer: AnchorCustomer): Promise<KycRecord> {
+    return this.accepted(customer);
+  }
   private accepted({ sellerId, account }: AnchorCustomer): KycRecord {
     return {
       sellerId,
+      anchorDomain: "testanchor.stellar.org",
       account,
       customerId: null,
       status: "ACCEPTED",

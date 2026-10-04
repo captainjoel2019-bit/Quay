@@ -87,7 +87,7 @@ function rowToLink(row: LinkRow): PaymentLink {
     overpaidAmount: row.overpaidAmount ?? null,
     offrampJobId: row.offrampJobId ?? null,
     offrampTargetCurrency: row.offrampTargetCurrency ?? null,
-    offrampStatus: row.offrampStatus ?? null,
+    offrampStatus: (row.offrampStatus ?? null) as PaymentLink["offrampStatus"],
     offrampIndicativeRate: row.offrampIndicativeRate ?? null,
     offrampRate: row.offrampRate ?? null,
     offrampRateDelta: row.offrampRateDelta ?? null,
@@ -890,6 +890,20 @@ function rowToQuote(row: OffRampQuoteRow): StoredOffRampQuote {
     sellAmount: row.sellAmount,
     buyCurrency: row.buyCurrency,
     price: row.price,
+    ...(row.quotedRate !== null &&
+    row.quotedTargetAmount !== null &&
+    row.quotedFeeAmount !== null &&
+    row.quotedNetTargetAmount !== null
+      ? {
+          quotedAmounts: {
+            rate: row.quotedRate,
+            targetAmount: row.quotedTargetAmount,
+            feeAmount: row.quotedFeeAmount,
+            feeSource: row.quotedFeeSource === "anchor" ? ("anchor" as const) : ("estimated" as const),
+            netTargetAmount: row.quotedNetTargetAmount,
+          },
+        }
+      : {}),
     expiresAt: row.expiresAt,
     createdAt: row.createdAt,
   };
@@ -927,6 +941,11 @@ export class DrizzleOffRampStateRepository implements OffRampStateRepository {
       sellAmount: quote.sellAmount,
       buyCurrency: quote.buyCurrency,
       price: quote.price,
+      quotedRate: quote.quotedAmounts?.rate ?? null,
+      quotedTargetAmount: quote.quotedAmounts?.targetAmount ?? null,
+      quotedFeeAmount: quote.quotedAmounts?.feeAmount ?? null,
+      quotedFeeSource: quote.quotedAmounts?.feeSource ?? null,
+      quotedNetTargetAmount: quote.quotedAmounts?.netTargetAmount ?? null,
       expiresAt: quote.expiresAt,
       createdAt: quote.createdAt,
     });
@@ -988,6 +1007,7 @@ export class DrizzleKycRepository implements KycRepository {
   private rowToRecord(row: SellerKycRow): KycRecord {
     return {
       sellerId: row.sellerId,
+      anchorDomain: row.anchorDomain,
       account: row.account ?? null,
       customerId: row.customerId ?? null,
       status: row.status as KycStatus,
@@ -1001,14 +1021,38 @@ export class DrizzleKycRepository implements KycRepository {
     };
   }
 
-  async get(sellerId: string): Promise<KycRecord | null> {
-    const rows = await this.db.select().from(sellerKyc).where(eq(sellerKyc.sellerId, sellerId)).limit(1);
+  async get(sellerId: string, anchorDomain: string): Promise<KycRecord | null> {
+    const rows = await this.db
+      .select()
+      .from(sellerKyc)
+      .where(and(eq(sellerKyc.sellerId, sellerId), eq(sellerKyc.anchorDomain, anchorDomain)))
+      .limit(1);
     return rows[0] ? this.rowToRecord(rows[0]) : null;
   }
 
+  async delete(sellerId: string, anchorDomain?: string): Promise<void> {
+    await this.db
+      .delete(sellerKyc)
+      .where(
+        anchorDomain === undefined
+          ? eq(sellerKyc.sellerId, sellerId)
+          : and(eq(sellerKyc.sellerId, sellerId), eq(sellerKyc.anchorDomain, anchorDomain)),
+      );
+  }
+
   async save(record: KycRecord): Promise<void> {
+    const binaryFieldNames = new Set(
+      record.requiredFields.filter((f) => f.type === "binary").map((f) => f.name),
+    );
+    for (const key of Object.keys(record.providedFields)) {
+      if (binaryFieldNames.has(key)) {
+        throw new Error(`Binary field ${key} must never be persisted in KYC providedFields`);
+      }
+    }
+
     const row = {
       sellerId: record.sellerId,
+      anchorDomain: record.anchorDomain,
       account: record.account,
       customerId: record.customerId,
       status: record.status,
@@ -1023,7 +1067,7 @@ export class DrizzleKycRepository implements KycRepository {
     await this.db
       .insert(sellerKyc)
       .values(row)
-      .onConflictDoUpdate({ target: sellerKyc.sellerId, set: row });
+      .onConflictDoUpdate({ target: [sellerKyc.sellerId, sellerKyc.anchorDomain], set: row });
   }
 
   async countNonPrimaryRows(): Promise<number> {
