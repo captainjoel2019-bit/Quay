@@ -20,8 +20,12 @@ import {
 } from "../../lib/anchor-session";
 import ApiKeys from "./ApiKeys";
 import KycPanel from "./KycPanel";
+import RegistrationForm from "./RegistrationForm";
+import ErasePanel from "./ErasePanel";
+import type { KycLoadState } from "../../lib/kyc-load";
 import DisclosuresPanel from "./DisclosuresPanel";
 import CashOutModal from "./CashOutModal";
+import { PendingTransferModal } from "./TransferStep";
 import { useSellerWallet } from "./SessionGate";
 
 // Mirrors the API's OFFRAMP setting (see .env.example) so this button never
@@ -170,11 +174,12 @@ interface TableProps {
   copied: string | null;
   onCopy: (id: string) => void;
   onCashOut: (id: string) => void;
+  onPendingTransfer: (id: string) => void;
   cashOutBlocked: boolean;
   anchorAuth: AnchorAuthView | null;
 }
 
-function LinksTable({ links, copied, onCopy, onCashOut, cashOutBlocked, anchorAuth }: TableProps) {
+function LinksTable({ links, copied, onCopy, onCashOut, onPendingTransfer, cashOutBlocked, anchorAuth }: TableProps) {
   return (
     <table className="table">
       <thead>
@@ -243,6 +248,19 @@ function LinksTable({ links, copied, onCopy, onCashOut, cashOutBlocked, anchorAu
                     )}
                   </>
                 )}
+                {/* Resume an unsent withdrawal transfer. Fetches the instructions only on
+                    click, so the 5s refresh loop adds no anchor round trip per link. */}
+                {OFFRAMP_ENABLED &&
+                  !OFFRAMP_IS_MOCK &&
+                  link.status === "offramp_pending" &&
+                  link.offrampStatus === "awaiting_transfer" && (
+                    <>
+                      {" · "}
+                      <button className="linkbtn" onClick={() => onPendingTransfer(link.id)}>
+                        Send USDC to finish cash-out
+                      </button>
+                    </>
+                  )}
               </td>
             </tr>
           );
@@ -274,8 +292,12 @@ export default function Dashboard() {
   const [disclosuresError, setDisclosuresError] = useState<string | null>(null);
   const [disclosureAction, setDisclosureAction] = useState<string | null>(null);
   const [anchorAuth, setAnchorAuth] = useState<AnchorAuthView | null>(null);
+  const [kycState, setKycState] = useState<KycLoadState>("idle");
+  const [kycError, setKycError] = useState<string | null>(null);
   // Which link has the cash-out modal open; null = closed (issue #32).
   const [cashOutLinkId, setCashOutLinkId] = useState<string | null>(null);
+  // Which pending link has the resume-transfer dialog open.
+  const [pendingTransferLinkId, setPendingTransferLinkId] = useState<string | null>(null);
 
   const [tab, setTab] = useState<"links" | "api-keys">("links");
 
@@ -301,18 +323,31 @@ export default function Dashboard() {
 
   const refreshKyc = useCallback(async () => {
     if (OFFRAMP_IS_MOCK || !OFFRAMP_ENABLED) return; // no real anchor, nothing to verify
+    setKycState("loading");
+    setKycError(null);
     try {
       // KYC lives at the anchor under the seller's own account, so it can only
       // be read once the seller's wallet has signed in there.
       const session = await api.getAnchorAuth();
       setAnchorAuth(session);
-      if (session.required && !session.connected) return;
+      if (session.required && !session.connected) {
+        setKycState("ready"); // the panel shows "Connect to anchor"
+        return;
+      }
       setKyc(await api.getKyc());
+      setKycState("ready");
     } catch (e) {
       if (e instanceof CheckoutError && e.code === "anchor_auth_required") {
         setAnchorAuth((prev) => (prev ? { ...prev, connected: false } : prev));
+        setKycState("ready");
+        return;
       }
-      /* dashboard still works without it; the cash-out button just stays gated */
+      // The dashboard still works without it; the cash-out button just stays
+      // gated. Surface the failure in the panel so the seller can retry.
+      setKycError(
+        e instanceof CheckoutError ? describeError(e) : "Could not load identity verification. Please try again.",
+      );
+      setKycState("error");
     }
   }, []);
 
@@ -615,7 +650,16 @@ export default function Dashboard() {
 
       {OFFRAMP_ENABLED && !OFFRAMP_IS_MOCK && (
         <>
-          <KycPanel kyc={kyc} anchor={anchorAuth} onUpdated={(updated) => { setKyc(updated); void refreshDisclosures(); }} onAnchorConnected={() => void refreshKyc()} />
+          <RegistrationForm />
+          <KycPanel
+            kyc={kyc}
+            anchor={anchorAuth}
+            loadState={kycState}
+            loadError={kycError}
+            onRetry={() => void refreshKyc()}
+            onUpdated={(updated) => { setKyc(updated); void refreshDisclosures(); }}
+            onAnchorConnected={() => void refreshKyc()}
+          />
           <DisclosuresPanel disclosures={disclosures} loading={disclosuresLoading} error={disclosuresError}
             deletableAnchorDomain={anchorAuth?.connected ? anchorAuth.anchor : null}
             onRetry={() => void refreshDisclosures()}
@@ -684,6 +728,7 @@ export default function Dashboard() {
                 copied={copied}
                 onCopy={copyCheckout}
                 onCashOut={(id) => setCashOutLinkId(id)}
+                onPendingTransfer={(id) => setPendingTransferLinkId(id)}
                 cashOutBlocked={cashOutBlocked}
                 anchorAuth={anchorAuth}
               />
@@ -701,6 +746,7 @@ export default function Dashboard() {
             copied={copied}
             onCopy={copyCheckout}
             onCashOut={(id) => setCashOutLinkId(id)}
+            onPendingTransfer={(id) => setPendingTransferLinkId(id)}
             cashOutBlocked={cashOutBlocked}
             anchorAuth={anchorAuth}
           />
@@ -737,6 +783,8 @@ export default function Dashboard() {
         </div>
       </section>
 
+      <ErasePanel />
+
       {/* Cash-out modal — rendered when a link's "Cash out" button is clicked */}
       {OFFRAMP_ENABLED && cashOutLinkId && cashOutLink && (
         <CashOutModal
@@ -747,6 +795,17 @@ export default function Dashboard() {
           isMock={OFFRAMP_IS_MOCK}
           onClose={() => setCashOutLinkId(null)}
           onSuccess={handleCashOutSuccess}
+        />
+      )}
+
+      {/* Resume an unsent cash-out transfer */}
+      {OFFRAMP_ENABLED && pendingTransferLinkId && (
+        <PendingTransferModal
+          linkId={pendingTransferLinkId}
+          onClose={() => {
+            setPendingTransferLinkId(null);
+            void refresh();
+          }}
         />
       )}
         </>

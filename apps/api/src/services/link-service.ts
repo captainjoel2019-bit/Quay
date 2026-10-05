@@ -38,7 +38,7 @@ import {
   type OffRampTelemetryRow,
   type WithdrawTransfer,
 } from "@checkout/core";
-import { Sep6ValidationError } from "@checkout/offramp";
+import { AnchorHttpError, Sep6ValidationError, anchorErrorSummary, truncateAnchorBody } from "@checkout/offramp";
 import { canReceiveAsset, resolveAsset, type StellarConfig } from "@checkout/stellar";
 import { Horizon, Operation, Transaction, type Memo } from "@stellar/stellar-sdk";
 import { newId, newMuxedId, newReference } from "./ids";
@@ -264,6 +264,8 @@ export class LinkService {
    * survives restart.
    */
   private readonly nextPollAtByLinkId = new Map<string, number>();
+  /** Jobs whose `cashout.transfer_required` event was already emitted by this process. */
+  private readonly transferRequiredLogged = new Set<string>();
   private static readonly POLL_BACKOFF_BASE_MS = 2_000;
   private static readonly POLL_BACKOFF_CAP_MS = 60_000;
   /**
@@ -483,8 +485,7 @@ export class LinkService {
         sourceAmount,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new HttpError(502, `Off-ramp preview error: ${message}`);
+      throw anchorFailure(err, this.deps.logger!);
     }
 
     // Persist the indicative rate for the target currency so triggerCashOut()
@@ -523,8 +524,7 @@ export class LinkService {
     try {
       requirements = await this.deps.offramp.offrampRequirements(link.asset.code, customerOf(seller));
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new HttpError(502, `Off-ramp requirements error: ${message}`);
+      throw anchorFailure(err, this.deps.logger!);
     }
 
     const savedFields: Record<string, string> | null = seller.payoutFields
@@ -853,6 +853,7 @@ export class LinkService {
       status = (await this.deps.kyc.status(customer)).status;
     } catch (err) {
       if (err instanceof AnchorAuthRequiredError) throw anchorAuthRequired();
+      if (err instanceof AnchorHttpError) throw anchorFailure(err, this.deps.logger!);
       throw err;
     }
     if (status !== "ACCEPTED") throw new HttpError(403, "kyc_required");
@@ -893,8 +894,7 @@ export class LinkService {
       if (err instanceof AnchorAuthRequiredError) throw anchorAuthRequired();
       throwIfUnknownWithdrawType(err, withdrawType);
       if (err instanceof OffRampRejectedError) throw offRampRejected(err);
-      const message = err instanceof Error ? err.message : String(err);
-      throw new HttpError(502, `Off-ramp error: ${message}`);
+      throw anchorFailure(err, log);
     }
   }
 
@@ -1039,7 +1039,7 @@ export class LinkService {
       }
       throwIfUnknownWithdrawType(err, body.withdrawType);
       if (err instanceof OffRampRejectedError) throw offRampRejected(err);
-      throw new HttpError(502, `Off-ramp error: ${message}`);
+      throw anchorFailure(err, child);
     }
 
     // Persist the (unmasked) merged fields for future reuse — never logged.
@@ -1144,6 +1144,39 @@ export class LinkService {
     };
   }
 
+  /**
+   * Retrieves any pending transfer instructions for a cash-out (e.g. SEP-24 pending_user_transfer_start).
+   * Returns null if the link does not exist, has no offramp job, or has no pending transfer instructions.
+   */
+  async getCashOutTransfer(linkId: string, opts: ServiceCallOptions = {}): Promise<WithdrawTransfer | null> {
+    const link = await this.deps.links.findById(linkId);
+    if (!link) return null;
+    // Instructions only matter while the withdrawal is open. A link that was never
+    // cashed out, or whose payout already settled or failed, has nothing to send.
+    if (link.status !== "offramp_pending") {
+      throw new HttpError(409, `Link must be offramp_pending to fetch transfer instructions (is "${link.status}")`);
+    }
+    if (!link.offrampJobId) return null;
+    try {
+      // Circuit breaker open: do not add load to a struggling anchor; the stored copy below answers.
+      if (!this.health.isAvailable()) throw new Error("anchor_unavailable");
+      const job = await this.deps.offramp.status(link.offrampJobId, opts);
+      return job.transfer ?? null;
+    } catch (err) {
+      // No live anchor session for this seller: the seller has to reconnect, same
+      // as quoting a cash-out. Do not paper over it with a stored copy.
+      if (err instanceof AnchorAuthRequiredError) throw anchorAuthRequired();
+      // The anchor could not be asked right now (offline, or the seller's session expired). Fall back to
+      // what was stored the last time it answered rather than hide instructions the seller still needs.
+      (opts.logger ?? this.deps.logger)?.warn(
+        { event: "cashout.transfer.status_failed", linkId, err },
+        "could not refresh the anchor status for transfer instructions; using the stored transfer",
+      );
+      const stored = await this.deps.offrampState.getJob(link.offrampJobId);
+      return stored?.transfer ?? null;
+    }
+  }
+
   /** Advance any pending cash-outs by polling the off-ramp adapter. */
   async pollCashOuts(opts: ServiceCallOptions = {}): Promise<void> {
     const log = (opts.logger ?? this.deps.logger!);
@@ -1164,11 +1197,38 @@ export class LinkService {
       const child = log.child({ linkId: link.id, jobId: link.offrampJobId });
       let job: OffRampJob;
       try {
+        // Read before polling: status() persists any deposit instructions, so
+        // "had none before this poll" is what makes the event fire once, and
+        // it still does after a restart.
+        const before = await this.deps.offrampState.getJob(link.offrampJobId).catch(() => null);
         job = await this.deps.offramp.status(link.offrampJobId, { logger: child });
-        // Successful poll clears any prior in-memory last_error + backoff.
+        if (job.transfer && !before?.transfer && !this.transferRequiredLogged.has(link.offrampJobId)) {
+          this.transferRequiredLogged.add(link.offrampJobId);
+          // Deliberately no memo/destination here: payment instructions stay
+          // out of plaintext logs. The seller still signs; nothing is sent
+          // from the server.
+          child.info(
+            {
+              event: "cashout.transfer_required",
+              linkId: link.id,
+              jobId: link.offrampJobId,
+              assetCode: job.transfer.asset.code,
+              amount: job.transfer.amount,
+            },
+            "anchor published deposit instructions; seller must send the asset",
+          );
+        }
+        // Successful poll clears any prior in-memory last_error + backoff + persisted poll error.
         this.lastPollErrorByLinkId.delete(link.id);
         this.consecutivePollErrorsByLinkId.delete(link.id);
         this.nextPollAtByLinkId.delete(link.id);
+        if (link.offrampJobId) {
+          await this.deps.offrampState.updateJob(link.offrampJobId, {
+            lastPollError: null,
+            lastPollErrorAt: null,
+            lastPollReason: null,
+          });
+        }
       } catch (err) {
         if (err instanceof OffRampJobNotFoundError) {
           // The adapter has no state for this job id at all — not a transient
@@ -1178,14 +1238,27 @@ export class LinkService {
           this.lastPollErrorByLinkId.delete(link.id);
           this.consecutivePollErrorsByLinkId.delete(link.id);
           this.nextPollAtByLinkId.delete(link.id);
+          if (link.offrampJobId) {
+            await this.deps.offrampState.updateJob(link.offrampJobId, {
+              lastPollError: null,
+              lastPollErrorAt: null,
+              lastPollReason: null,
+            });
+          }
           continue;
         }
-        // ATTRIBUTABLE: record the error against the link id so it can be
-        // exposed in a follow-up PR (and is logged now). Without this catch
-        // the swallowed error meant a downed anchor's failures evaporated.
-        const message = err instanceof Error ? err.message : String(err);
-        this.lastPollErrorByLinkId.set(link.id, message);
-        console.warn(`[offramp] poll failed for link ${link.id}: ${message}`);
+        // Classify the poll error into a sanitized, seller-safe reason and message.
+        const { reason, message: safeMessage } = classifyPollError(err);
+        if (link.offrampJobId) {
+          await this.deps.offrampState.updateJob(link.offrampJobId, {
+            lastPollError: safeMessage,
+            lastPollErrorAt: Date.now(),
+            lastPollReason: reason,
+          });
+        }
+        const rawMessage = err instanceof Error ? err.message : String(err);
+        this.lastPollErrorByLinkId.set(link.id, rawMessage);
+        console.warn(`[offramp] poll failed for link ${link.id}: ${rawMessage}`);
         // Exponential backoff per job (in-memory). Capped so a long-lived
         // pending job doesn't end up wedged for hours.
         const prev = this.consecutivePollErrorsByLinkId.get(link.id) ?? 0;
@@ -1335,11 +1408,24 @@ export class LinkService {
   }
 
   /**
-   * Read the in-memory last poll error for a single link, if any. Surface this
-   * in a follow-up PR; for now it's the attribution trail the issue asked for.
+   * Read the in-memory last poll error for a single link, if any.
    */
   lastPollErrorFor(linkId: string): string | null {
     return this.lastPollErrorByLinkId.get(linkId) ?? null;
+  }
+
+  /**
+   * Returns the persisted poll error details for an offramp_pending link, or null.
+   */
+  async getOfframpPollStatus(link: PaymentLink): Promise<{ reason: string; message: string; at: number } | null> {
+    if (link.status !== "offramp_pending" || !link.offrampJobId) return null;
+    const job = await this.deps.offrampState.getJob(link.offrampJobId);
+    if (!job || !job.lastPollReason || !job.lastPollError || !job.lastPollErrorAt) return null;
+    return {
+      reason: job.lastPollReason,
+      message: job.lastPollError,
+      at: job.lastPollErrorAt,
+    };
   }
 
   /**
@@ -1460,6 +1546,26 @@ function anchorAuthRequired(): HttpError {
   return new HttpError(403, "anchor_auth_required");
 }
 
+/**
+ * The client-facing outcome of a failed anchor call: 502 `anchor_error` with a
+ * fixed, safe `message`. The anchor's own response body is third-party content
+ * (it can be an HTML page, a stack trace, or an echo of the seller's KYC and
+ * bank fields), so it goes to the server log only, truncated, and never into
+ * the response or the stored idempotency record (issue 4.36).
+ */
+export function anchorFailure(err: unknown, log: Logger): HttpError {
+  if (err instanceof AnchorHttpError) {
+    log.error(
+      { event: "anchor.error", sep: err.sep, op: err.op, statusCode: err.status, body: err.body },
+      "anchor returned an error",
+    );
+    return new HttpError(502, "anchor_error", { message: anchorErrorSummary(err) });
+  }
+  const detail = err instanceof Error ? err.message : String(err);
+  log.error({ event: "anchor.error", error: truncateAnchorBody(detail) }, "anchor call failed");
+  return new HttpError(502, "anchor_error", { message: "The anchor could not be reached or sent an unexpected response." });
+}
+
 /** A cash-out starts from `paid`, or retries from `offramp_failed`; the state machine decides. */
 function assertCanCashOut(link: PaymentLink): void {
   if (!canTransition(link.status, "offramp_pending")) {
@@ -1484,6 +1590,45 @@ export class HttpError extends Error {
   ) {
     super(message);
   }
+}
+
+export function classifyPollError(err: unknown): { reason: string; message: string } {
+  if (err instanceof AnchorAuthRequiredError || (err instanceof Error && err.message.includes("anchor_auth_required"))) {
+    return {
+      reason: "anchor_auth_required",
+      message: "Anchor session expired or required. Please reconnect your anchor session in settings.",
+    };
+  }
+  const rawMsg = err instanceof Error ? err.message : String(err);
+  if (rawMsg.toLowerCase().includes("circuit open")) {
+    return {
+      reason: "circuit_open",
+      message: "Anchor calls are temporarily paused due to upstream service degradation. We will retry shortly.",
+    };
+  }
+  if (
+    rawMsg.includes("fetch failed") ||
+    rawMsg.includes("ECONNREFUSED") ||
+    rawMsg.includes("ECONNRESET") ||
+    rawMsg.includes("ETIMEDOUT") ||
+    rawMsg.includes("ENOTFOUND") ||
+    rawMsg.includes("DNS") ||
+    rawMsg.includes("timeout") ||
+    rawMsg.includes("anchor down") ||
+    rawMsg.includes("502") ||
+    rawMsg.includes("503") ||
+    rawMsg.includes("504") ||
+    rawMsg.includes("anchor unavailable")
+  ) {
+    return {
+      reason: "anchor_unreachable",
+      message: "The anchor could not be reached. We will keep trying.",
+    };
+  }
+  return {
+    reason: "unknown",
+    message: "A transient error occurred while checking cash-out status. We will keep trying.",
+  };
 }
 
 /**

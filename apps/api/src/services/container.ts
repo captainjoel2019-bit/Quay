@@ -27,6 +27,7 @@ import type {
   OffRampStateRepository,
   OffRampTelemetryRepository,
   RailPort,
+  SellerProfileRepository,
   WebhookRepository,
 } from "@checkout/core";
 import { KycConsentRepository } from "@checkout/core";
@@ -48,7 +49,9 @@ import {
   DrizzleOfframpTelemetryRepository,
   DrizzleApiKeyRepository,
   DrizzleAnchorSessionRepository,
+  ANCHOR_SESSION_SWEEP_GRACE_MS,
   DrizzleKycConsentRepository,
+  DrizzleSellerProfileRepository,
 } from "../repos/index";
 import { LinkService, AnchorHealth } from "./link-service";
 import {
@@ -80,14 +83,18 @@ export interface Container {
   kyc: KycPort;
   /** Per-anchor KYC consent repository. */
   kycConsents: KycConsentRepository;
+  /** The seller's reusable SEP-9 profile (issue 4.23). Null unless a real anchor and
+   *  KYC_ENCRYPTION_KEY are configured, since values are encrypted with that key. */
+  sellerProfile?: SellerProfileRepository | null;
   /** The anchor's home domain (e.g. "testanchor.stellar.org") for consent tracking. Null when no real anchor. */
   anchorDomain: string | null;
+  kycRepo?: DrizzleKycRepository | null;
   /** Sellers' own SEP-10 sessions with the anchor. Null when there is no real
    *  anchor (OFFRAMP=mock|none), so nothing to sign in to. */
   anchorAuth: SellerAnchorAuth | null;
   deleteAnchorCustomer?: ((customer: AnchorCustomer) => Promise<"deleted" | "not_found">) | null;
   telemetry: OffRampTelemetryRepository;
-  config: { network: string; horizonUrl: string; sellerWallet: string | null };
+  config: { network: string; horizonUrl: string; sellerWallet: string | null; kycStatusCacheMs?: number };
   horizonStatus(): HorizonStatus;
   /** Optional SSRF guard override for webhook URLs. Tests inject a permissive
    *  one so route tests do not depend on live DNS. */
@@ -167,7 +174,12 @@ export async function createContainer(): Promise<Container> {
   const offrampStateRepo = new DrizzleOffRampStateRepository(db);
   const telemetryRepo = new DrizzleOfframpTelemetryRepository(db);
   const apiKeysRepo = new DrizzleApiKeyRepository(db);
+  const anchorSessionsRepo = new DrizzleAnchorSessionRepository(db);
   const kycConsentsRepo = new DrizzleKycConsentRepository(db);
+  const kycKeyring = env.kycEncryptionKey
+    ? parsePiiKeyring(env.kycEncryptionKey, env.kycEncryptionKeyPrevious)
+    : null;
+  const kycRepo = kycKeyring ? new DrizzleKycRepository(db, kycKeyring) : null;
 
   // Optional. Quay is multi-tenant: a seller signs in with their own wallet
   // over SEP-10, that address becomes their identity AND their payout
@@ -210,11 +222,12 @@ export async function createContainer(): Promise<Container> {
     env.watchMode === "stream"
       ? new StreamingHorizonWatcher(stellar.horizonUrl, { log: (m) => console.log(`[watcher:stream] ${m}`) })
       : pollingWatcher;
-  const anchor = createAnchor(db, logger, stellar.networkPassphrase);
+  const anchor = createAnchor(db, logger, stellar.networkPassphrase, anchorSessionsRepo);
   const offramp = new CircuitBreakerOffRamp(createOffRamp(anchor, offrampStateRepo, logger));
   const kycAnchorDomain = env.anchorHomeDomain ?? TESTANCHOR_HOME_DOMAIN;
   const webhookSender = new WebhookSender(webhooksRepo, { maxAttempts: 1, logger });
-  const kyc = createKyc(anchor, db, sellersRepo, webhooksRepo, webhookSender, kycAnchorDomain);
+  const kyc = createKyc(anchor, kycRepo, sellersRepo, webhooksRepo, webhookSender, kycAnchorDomain, logger);
+  const sellerProfileRepo = await createSellerProfile(anchor, db, logger);
   const anchorDomain = anchor?.auth.anchorDomain ?? null;
 
   // Anchor health probe + circuit breaker (issue #19, 3.7). With mock or no
@@ -306,7 +319,9 @@ export async function createContainer(): Promise<Container> {
     db,
     kyc,
     kycConsents: kycConsentsRepo,
+    sellerProfile: sellerProfileRepo,
     anchorDomain,
+    kycRepo,
     anchorAuth: anchor?.auth ?? null,
     deleteAnchorCustomer: anchor ? async (customer) => {
       const jwt = await anchor.auth.token(customer);
@@ -314,7 +329,7 @@ export async function createContainer(): Promise<Container> {
       return deleteSep12Customer(kycServer, jwt, customer.account);
     } : null,
     telemetry: telemetryRepo,
-    config: { network: stellar.network, horizonUrl: stellar.horizonUrl, sellerWallet },
+    config: { network: stellar.network, horizonUrl: stellar.horizonUrl, sellerWallet, kycStatusCacheMs: env.kycStatusCacheMs },
     horizonStatus: () => pollingWatcher.getStatus(),
     metricsToken,
     watcherLagSeconds: () => loop.getLagSeconds(),
@@ -349,10 +364,21 @@ export async function createContainer(): Promise<Container> {
         stopPoller = startCashOutPoller(service, Math.max(3000, env.pollMs));
         stopProbe = startAnchorProbeTimer(anchorHealth, 60_000);
       }
-      const sweepTimer = setInterval(
-        () => void revocationsRepo.sweepExpired(Math.floor(Date.now() / 1000)),
-        60 * 60 * 1000, // hourly — revocation rows are cheap and self-limiting (max 24h lifetime) anyway
-      );
+      const sweepTimer = setInterval(() => {
+        void revocationsRepo.sweepExpired(Math.floor(Date.now() / 1000));
+        if (anchor) {
+          void anchorSessionsRepo
+            .sweepExpired(Date.now(), ANCHOR_SESSION_SWEEP_GRACE_MS)
+            .then((count) => {
+              if (count > 0) {
+                logger.info({ event: "anchor.sessions.swept", count }, `swept ${count} expired anchor session(s)`);
+              }
+            })
+            .catch((err) => {
+              logger.warn({ event: "anchor.sessions.sweep_failed", err }, "failed to sweep expired anchor sessions");
+            });
+        }
+      }, 60 * 60 * 1000); // hourly — revocation rows are cheap and self-limiting (max 24h lifetime) anyway
       stopRevocationSweep = () => clearInterval(sweepTimer);
 
       if (env.kycRetentionDays > 0) {
@@ -475,7 +501,12 @@ interface AnchorWiring {
  * own customer at the anchor, and the server holds nothing that can sign for
  * a seller's funds.
  */
-function createAnchor(db: DB, logger: Logger, networkPassphrase: string): AnchorWiring | null {
+function createAnchor(
+  db: DB,
+  logger: Logger,
+  networkPassphrase: string,
+  sessions: DrizzleAnchorSessionRepository = new DrizzleAnchorSessionRepository(db),
+): AnchorWiring | null {
   if (env.offramp !== "testanchor" && env.offramp !== "anchor") return null;
   // For OFFRAMP=anchor env.ts already required both; the fallbacks are the
   // testanchor sandbox preset.
@@ -490,7 +521,7 @@ function createAnchor(db: DB, logger: Logger, networkPassphrase: string): Anchor
   const auth = new SellerAnchorAuth({
     discovery,
     networkPassphrase,
-    sessions: new DrizzleAnchorSessionRepository(db),
+    sessions,
     logger,
   });
   return { discovery, auth };
@@ -520,25 +551,42 @@ function createOffRamp(anchor: AnchorWiring | null, state: OffRampStateRepositor
   });
 }
 
-function createKyc(
+/**
+ * The seller's reusable SEP-9 profile (issue 4.23). Only exists when a real
+ * anchor is configured, i.e. exactly when KYC_ENCRYPTION_KEY is guaranteed set
+ * (see env.ts). On boot it lifts existing `seller_kyc` values into the profile
+ * once; the migration is idempotent and logs counts, never values.
+ */
+async function createSellerProfile(
   anchor: AnchorWiring | null,
   db: DB,
+  logger: Logger,
+): Promise<DrizzleSellerProfileRepository | null> {
+  if (!anchor) return null;
+  const keyring = parsePiiKeyring(env.kycEncryptionKey as string, env.kycEncryptionKeyPrevious);
+  const repo = new DrizzleSellerProfileRepository(db, keyring);
+  const result = await repo.migrateFromSellerKyc();
+  logger.info(
+    { event: "seller_profile.migrated", ...result },
+    `seller profile migration: ${result.migrated} field(s) from ${result.rows} seller_kyc row(s), ${result.failed} unreadable`,
+  );
+  return repo;
+}
+
+function createKyc(
+  anchor: AnchorWiring | null,
+  repo: DrizzleKycRepository | null,
   sellersRepo: DrizzleSellerRepository,
-  webhooks?: WebhookRepository,
-  sender?: WebhookSender,
-  anchorDomain?: string,
+  webhooks: WebhookRepository | undefined,
+  sender: WebhookSender | undefined,
+  anchorDomain: string | undefined,
+  logger: Logger,
 ): KycPort {
-  if (!anchor) {
+  if (!anchor || !repo) {
     // No real anchor, nothing to be compliant with. For "none" there is no
     // cash-out to gate at all; for "mock" it never gates the simulated one.
     return new NoKycRequired();
   }
-  // env.kycEncryptionKey is guaranteed set whenever OFFRAMP is testanchor/anchor (see env.ts).
-  const keyring = parsePiiKeyring(
-    env.kycEncryptionKey as string,
-    env.kycEncryptionKeyPrevious,
-  );
-  const repo = new DrizzleKycRepository(db, keyring);
   repo
     .countNonPrimaryRows()
     .then((count) => {
@@ -555,7 +603,20 @@ function createKyc(
       return { fields: seller.payoutFields };
     },
   };
-  const baseKyc = new TestAnchorKyc({ discovery: anchor.discovery, auth: anchor.auth, repo, profileRepo });
+  // Public base URL of this API, used to register a SEP-12 push callback with the anchor.
+  const callbackBaseUrl = env.homeDomain
+    ? env.homeDomain.startsWith("http://") || env.homeDomain.startsWith("https://")
+      ? env.homeDomain
+      : `https://${env.homeDomain}`
+    : undefined;
+  const baseKyc = new TestAnchorKyc({
+    discovery: anchor.discovery,
+    auth: anchor.auth,
+    repo,
+    profileRepo,
+    callbackBaseUrl,
+    logger,
+  });
   if (webhooks && sender && anchorDomain) {
     return new KycEvents({
       inner: baseKyc,

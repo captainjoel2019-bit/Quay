@@ -89,6 +89,8 @@ const BOOTSTRAP_SQL = [
      job_id TEXT PRIMARY KEY, link_id TEXT NOT NULL, anchor TEXT NOT NULL,
      seller_id TEXT, account TEXT, target_currency TEXT NOT NULL, target_amount TEXT NOT NULL, rate TEXT NOT NULL,
      status TEXT NOT NULL, external_status TEXT, last_error TEXT,
+     sell_asset_code TEXT, sell_asset_issuer TEXT, sell_amount TEXT, transfer_json TEXT,
+     last_poll_error TEXT, last_poll_error_at INTEGER, last_poll_reason TEXT,
      transfer_notified_at INTEGER,
      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
    )`,
@@ -96,6 +98,7 @@ const BOOTSTRAP_SQL = [
      seller_id TEXT NOT NULL, anchor_domain TEXT NOT NULL,
      account TEXT, customer_id TEXT, status TEXT NOT NULL,
      required_fields TEXT NOT NULL, fields_encrypted TEXT NOT NULL,
+     callback_token_hash TEXT,
      message TEXT, last_synced_at INTEGER, updated_at INTEGER NOT NULL,
      provided_field_status TEXT, sent_fields TEXT,
      PRIMARY KEY (seller_id, anchor_domain)
@@ -176,6 +179,17 @@ const BOOTSTRAP_SQL = [
      notice_version TEXT NOT NULL,
      UNIQUE(seller_id, anchor_domain)
    )`,
+  // Reusable, anchor-independent SEP-9 identity values (issue 4.23): one row
+  // per (seller, field). Field names are canonical SEP-9 names, not PII; every
+  // value is AES-256-GCM encrypted (encryptPii) and never stored in plaintext.
+  `CREATE TABLE IF NOT EXISTS seller_profile (
+     seller_id TEXT NOT NULL,
+     field TEXT NOT NULL,            -- canonical SEP-9 name
+     value_encrypted TEXT NOT NULL,  -- encryptPii(value)
+     source TEXT NOT NULL,           -- 'seller' | 'migrated_from_seller_kyc'
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (seller_id, field)
+   )`,
 ];
 
 // Additive column added after the initial release. `CREATE TABLE IF NOT EXISTS`
@@ -211,11 +225,23 @@ const ADDITIVE_MIGRATIONS = [
   // the old shared platform account and are treated as such.
   `ALTER TABLE offramp_jobs ADD COLUMN seller_id TEXT`,
   `ALTER TABLE offramp_jobs ADD COLUMN account TEXT`,
+  // 3.9: SEP-6 deposit instructions can arrive after the withdraw call. The job
+  // remembers what it sold and the instructions once published. Additive; old
+  // rows stay NULL.
+  `ALTER TABLE offramp_jobs ADD COLUMN sell_asset_code TEXT`,
+  `ALTER TABLE offramp_jobs ADD COLUMN sell_asset_issuer TEXT`,
+  `ALTER TABLE offramp_jobs ADD COLUMN sell_amount TEXT`,
+  `ALTER TABLE offramp_jobs ADD COLUMN transfer_json TEXT`,
+  `ALTER TABLE offramp_jobs ADD COLUMN last_poll_error TEXT`,
+  `ALTER TABLE offramp_jobs ADD COLUMN last_poll_error_at INTEGER`,
+  `ALTER TABLE offramp_jobs ADD COLUMN last_poll_reason TEXT`,
   `ALTER TABLE seller_kyc ADD COLUMN account TEXT`,
   `ALTER TABLE sellers ADD COLUMN last_active_at INTEGER`,
   // Track whether the offramp.transfer_required webhook has been sent for a job.
   // Null means not yet sent; epoch-ms when sent.
   `ALTER TABLE offramp_jobs ADD COLUMN transfer_notified_at INTEGER`,
+  `ALTER TABLE seller_kyc ADD COLUMN callback_token_hash TEXT`,
+  `CREATE INDEX IF NOT EXISTS seller_kyc_callback_token_hash_idx ON seller_kyc (callback_token_hash)`,
   // BUG-4.21: a `sellers` table created before `wallet` gained UNIQUE still has
   // a plain `wallet TEXT NOT NULL`, and CREATE TABLE IF NOT EXISTS never
   // upgrades an existing table. `createIfAbsent` uses ON CONFLICT (wallet),

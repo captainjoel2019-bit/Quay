@@ -17,7 +17,7 @@
     "docs:check-status-diagram": "node scripts/gen-status-diagram.mjs --check",
     "docs:check-domain-boundary": "node scripts/check-domain-boundary.mjs",
     "docs:check-env-docs": "node scripts/check-env-docs.mjs",
-"e2e": "pnpm --filter @checkout/web e2e",
+    "e2e": "pnpm --filter @checkout/web e2e",
     "e2e:live": "pnpm --filter @checkout/web e2e:live",
     "check:no-server-signing": "node scripts/check-no-server-signing.mjs",
     "sweep": "node scripts/uptime-check.mjs && pnpm e2e:live",

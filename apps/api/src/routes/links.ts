@@ -135,7 +135,7 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
       }
       return ctx.json(result);
     } catch (err) {
-      if (err instanceof HttpError) return ctx.json({ error: err.message }, err.status as 404 | 409 | 502);
+      if (err instanceof HttpError) return ctx.json({ error: err.message, ...err.extra }, err.status as 404 | 409 | 502);
       throw err;
     }
   });
@@ -166,7 +166,7 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
       return ctx.json(result);
     } catch (err) {
       if (err instanceof OffRampDisabledError) return ctx.json(OFFRAMP_DISABLED_BODY, 501);
-      if (err instanceof HttpError) return ctx.json({ error: err.message }, err.status as 404 | 403 | 502);
+      if (err instanceof HttpError) return ctx.json({ error: err.message, ...err.extra }, err.status as 404 | 403 | 502);
       throw err;
     }
   });
@@ -269,6 +269,31 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
     }
   });
 
+  // Non-custodial transfer instructions for cash-out (e.g. SEP-24 pending_user_transfer_start).
+  // Scoped to offramp:initiate and seller ownership, returning { transfer } or 404.
+  app.get("/:id/cash-out/transfer", auth, requireScope("offramp:initiate"), async (ctx) => {
+    const log = getLogger(ctx);
+    const linkId = ctx.req.param("id");
+    const existing = await c.service.getLink(linkId);
+    if (!existing) return ctx.json({ error: "not_found" }, 404);
+    if (existing.link.sellerId !== ctx.get("seller").id) {
+      log.warn({ event: "cashout.transfer.rejected", linkId }, "cash-out transfer rejected: not the link's seller");
+      return ctx.json({ error: "not_found" }, 404);
+    }
+    try {
+      const transfer = await c.service.getCashOutTransfer(linkId, { logger: log });
+      if (!transfer) {
+        return ctx.json({ error: "not_found" }, 404);
+      }
+      return ctx.json({ transfer });
+    } catch (err) {
+      // 409 when the link is not offramp_pending; 403 anchor_auth_required when
+      // the seller has no live anchor session.
+      if (err instanceof HttpError) return ctx.json({ error: err.message, ...err.extra }, err.status as 403 | 404 | 409);
+      throw err;
+    }
+  });
+
   // Link detail with webhook deliveries (for the seller's timeline page).
   // Gated and ownership-checked: unlike GET /:id this is the seller's
   // reconciliation view and carries webhook delivery history.
@@ -281,11 +306,18 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
       return ctx.json({ error: "not_found" }, 404);
     }
     const deliveries = await c.webhooks.listDeliveriesByLinkId(result.link.id);
+    const offrampPoll = await c.service.getOfframpPollStatus(result.link);
     // Raw upstream status for the seller's interactive step (issue 5.20):
     // SEP-24 `incomplete` reads as "waiting on you" in the UI, while the
     // mapped offrampStatus stays `pending`.
     const offrampExternalStatus = await c.service.getOffRampExternalStatus(result.link);
-    return ctx.json({ link: result.link, request: result.request, deliveries, offrampExternalStatus });
+    return ctx.json({
+      link: result.link,
+      request: result.request,
+      deliveries,
+      offrampExternalStatus,
+      offrampPoll,
+    });
   });
 
   // Seller voids a link they created by mistake. Idempotent: cancelling an

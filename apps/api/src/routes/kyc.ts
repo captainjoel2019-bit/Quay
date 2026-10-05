@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -11,8 +11,11 @@ import {
   type KycConsent,
   type KycUploadFile,
 } from "@checkout/core";
+import { AnchorHttpError } from "@checkout/offramp";
 import { env } from "../env";
 import type { Container } from "../services/container";
+import { anchorFailure } from "../services/link-service";
+import { getLogger } from "../request-context";
 import { customerOf } from "../services/link-service";
 import { buildAuthMiddleware, requireScope, type AuthVariables } from "../middleware/auth";
 import { kycDisclosureFields, sellerKyc } from "../db/schema";
@@ -60,6 +63,23 @@ function consentToResponse(consent: KycConsent) {
  * Consent routes (GET/POST/DELETE /consent/*) reject API-key auth — only
  * session-authenticated sellers can grant or revoke consent.
  */
+/**
+ * An anchor that is down, unreachable or answering with an error is a 502 the
+ * dashboard can explain, not a 500. The anchor's own response text never
+ * reaches the client (issue 4.36); unknown errors are left to `app.onError`.
+ */
+function anchorFailureResponse(ctx: Context<{ Variables: AuthVariables }>, err: unknown) {
+  if (!(err instanceof AnchorHttpError) && !isNetworkError(err)) return null;
+  const failure = anchorFailure(err, getLogger(ctx));
+  return ctx.json({ error: failure.message, ...failure.extra }, 502);
+}
+
+/** `fetch` rejects with a TypeError on DNS, connection and TLS failures, and with an AbortError/TimeoutError on timeouts. */
+function isNetworkError(err: unknown): boolean {
+  if (err instanceof TypeError) return true;
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
+}
+
 export function kycRoutes(c: Container): Hono<{ Variables: AuthVariables }> {
   const app = new Hono<{ Variables: AuthVariables }>();
 
@@ -147,6 +167,8 @@ export function kycRoutes(c: Container): Hono<{ Variables: AuthVariables }> {
       return ctx.json(consentToResponse(consent), 201);
     } catch (err) {
       if (err instanceof AnchorAuthRequiredError) return ctx.json({ error: "anchor_auth_required" }, 403);
+      const failed = anchorFailureResponse(ctx, err);
+      if (failed) return failed;
       throw err;
     }
   });
@@ -232,13 +254,17 @@ export function kycRoutes(c: Container): Hono<{ Variables: AuthVariables }> {
     }
   });
 
-  // Current requirements + status, re-synced from the anchor.
+  // Current requirements + status, re-synced from the anchor (or served from cache).
   app.get("/", async (ctx) => {
     try {
-      const record = await c.kyc.status(customerOf(ctx.get("seller")));
+      const refresh = ctx.req.query("refresh") === "1" || ctx.req.query("refresh") === "true";
+      const maxAgeMs = refresh ? 0 : (c.config.kycStatusCacheMs ?? 60_000);
+      const record = await c.kyc.status(customerOf(ctx.get("seller")), { maxAgeMs });
       return ctx.json(toResponse(record));
     } catch (err) {
       if (err instanceof AnchorAuthRequiredError) return ctx.json({ error: "anchor_auth_required" }, 403);
+      const failed = anchorFailureResponse(ctx, err);
+      if (failed) return failed;
       throw err;
     }
   });
@@ -304,6 +330,8 @@ export function kycRoutes(c: Container): Hono<{ Variables: AuthVariables }> {
       if (err instanceof KycRequiredError) {
         return ctx.json({ error: "kyc_required", missingFields: err.missingFields }, 422);
       }
+      const failed = anchorFailureResponse(ctx, err);
+      if (failed) return failed;
       throw err;
     }
   });
@@ -333,6 +361,8 @@ export function kycRoutes(c: Container): Hono<{ Variables: AuthVariables }> {
         record = await c.kyc.status(customer);
       } catch (err) {
         if (err instanceof AnchorAuthRequiredError) return ctx.json({ error: "anchor_auth_required" }, 403);
+        const failed = anchorFailureResponse(ctx, err);
+        if (failed) return failed;
         throw err;
       }
 
@@ -410,6 +440,8 @@ export function kycRoutes(c: Container): Hono<{ Variables: AuthVariables }> {
         if (err instanceof KycRequiredError) {
           return ctx.json({ error: "kyc_required", missingFields: err.missingFields }, 422);
         }
+        const failed = anchorFailureResponse(ctx, err);
+        if (failed) return failed;
         throw err;
       }
     },

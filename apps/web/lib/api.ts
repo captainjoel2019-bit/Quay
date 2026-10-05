@@ -51,10 +51,17 @@ export interface WebhookDelivery {
   createdAt: number;
 }
 
+export interface OfframpPollStatus {
+  reason: string;
+  message: string;
+  at: number;
+}
+
 export interface LinkDetail {
   link: PaymentLink;
   request: PaymentRequest;
   deliveries: WebhookDelivery[];
+  offrampPoll?: OfframpPollStatus | null;
   /** Raw upstream status from offramp_jobs.external_status (e.g. SEP-24 "incomplete"). Null when no job ran yet. */
   offrampExternalStatus: string | null;
 }
@@ -87,6 +94,26 @@ export interface KycView {
   providedFields: Record<string, string>;
   message: string | null;
   lastSyncedAt: number | null;
+}
+
+/** The seller's stored identity profile, keyed by SEP-9 field name. PII: never log or persist it. */
+export interface ProfileView {
+  fields: Record<string, string>;
+  updatedAt: Record<string, number>;
+}
+
+/** Wire shape of GET/PUT /seller/profile (issue 4.23). */
+interface ProfileResponse {
+  fields: Array<{ field: string; value: string; source: string; updatedAt: number }>;
+}
+
+export function toProfileView(res: ProfileResponse): ProfileView {
+  const view: ProfileView = { fields: {}, updatedAt: {} };
+  for (const f of res.fields ?? []) {
+    view.fields[f.field] = f.value;
+    view.updatedAt[f.field] = f.updatedAt;
+  }
+  return view;
 }
 
 /** Disclosure metadata only. Field values must never appear in this response. */
@@ -186,9 +213,66 @@ export type ApiErrorCode =
   // Operator telemetry (issue 5.21):
   | "unauthorized" // telemetry token rejected
   | "telemetry_not_enabled" // deployment has no TELEMETRY_TOKEN configured
-  | "telemetry_error"; // any other telemetry-route failure
+  | "telemetry_error" // any other telemetry-route failure
+  | "anchor_unavailable" // 503: the seller's anchor is down or its circuit breaker is open
+  | "offramp_disabled" // 501: this deployment has no off-ramp configured
+  | "quote_expired" // 409 `quote_expired: <detail>`: the anchor quote lapsed before use
+  | "request_in_progress" // 409: same Idempotency-Key still running, or key reused with a different body
+  | "challenge_rejected"; // anchor SEP-10 challenge refused (400/502)
+
+const BY_REASON_409: Record<string, ApiErrorCode> = {
+  insufficient_balance: "insufficient_balance",
+  missing_trustline: "missing_trustline",
+  wrong_network: "wrong_network",
+};
+
+// Codes the API names explicitly; these win over the generic `>= 500` rule.
+const EXPLICIT: Record<string, ApiErrorCode> = {
+  anchor_unavailable: "anchor_unavailable",
+  offramp_disabled: "offramp_disabled",
+  request_in_progress: "request_in_progress",
+  idempotency_key_reuse: "request_in_progress",
+  challenge_rejected: "challenge_rejected",
+};
+
+const BY_CODE: Record<string, ApiErrorCode> = {
+  not_found: "not_found",
+  invalid_body: "invalid_body",
+  kyc_required: "kyc_required",
+  offramp_rejected: "offramp_rejected",
+  anchor_auth_required: "anchor_auth_required",
+  destination_cannot_receive: "destination_cannot_receive",
+  payment_rejected: "payment_rejected",
+};
+
+/**
+ * Map an API error response to an ApiErrorCode. Pure. Precedence: explicit new
+ * codes, then `>= 500`, then 409 + `reason`, 409 + `payment_rejected`, 409 as
+ * `conflict`, then by `error` code, else `server_error`.
+ */
+export function classifyError(status: number, body: Record<string, unknown>): ApiErrorCode {
+  const error = typeof body.error === "string" ? body.error : "";
+  const reason = typeof body.reason === "string" ? body.reason : "";
+
+  if (Object.hasOwn(EXPLICIT, error)) return EXPLICIT[error]!;
+  if (error.startsWith("quote_expired")) return "quote_expired";
+
+  if (status >= 500) return "server_error";
+
+  if (status === 409 && Object.hasOwn(BY_REASON_409, reason)) return BY_REASON_409[reason]!;
+  if (status === 409 && error === "payment_rejected") return "payment_rejected";
+  if (status === 409) return "conflict";
+
+  return Object.hasOwn(BY_CODE, error) ? BY_CODE[error]! : "server_error";
+}
 
 /** Structured error thrown by http() so callers can branch on code. */
+export interface ErasureResult {
+  erased: string[];
+  anchors: Array<{ anchorDomain: string; result: string }>;
+  retained: Array<{ what: string; why: string }>;
+}
+
 export class CheckoutError extends Error {
   constructor(
     readonly code: ApiErrorCode,
@@ -246,6 +330,16 @@ export function describeError(err: CheckoutError): string {
       return "We can't reach the payment service right now. Check your connection and try again.";
     case "server_error":
       return "Something went wrong on the server. Please try again in a moment.";
+    case "anchor_unavailable":
+      return "The anchor is currently unavailable. Please try again later.";
+    case "offramp_disabled":
+      return "Offramping is currently disabled for this anchor.";
+    case "quote_expired":
+      return "The quote expired before the transaction could complete. Try refreshing.";
+    case "request_in_progress":
+      return "This request is already being processed. Please wait.";
+    case "challenge_rejected":
+      return "The anchor rejected the sign-in challenge. Please try again.";
     case "consent_required":
       return "You need to approve sharing these identity fields with the anchor before submitting.";
     default:
@@ -322,35 +416,7 @@ async function http<T>(path: string, init?: RequestInit & { idempotencyKey?: str
     const { error, missingFields: rawMissing, message, ...details } = body;
     const apiCode = typeof error === "string" ? error : undefined;
     const missingFields = Array.isArray(rawMissing) ? (rawMissing as string[]) : undefined;
-    const reason = typeof details.reason === "string" ? details.reason : undefined;
-    const code: ApiErrorCode =
-      res.status >= 500
-        ? "server_error"
-        : res.status === 409 && reason === "insufficient_balance"
-          ? "insufficient_balance"
-          : res.status === 409 && reason === "missing_trustline"
-            ? "missing_trustline"
-            : res.status === 409 && reason === "wrong_network"
-              ? "wrong_network"
-              : res.status === 409 && apiCode === "payment_rejected"
-                ? "payment_rejected"
-                : res.status === 409
-                  ? "conflict"
-                  : apiCode === "not_found"
-                    ? "not_found"
-                    : apiCode === "invalid_body"
-                      ? "invalid_body"
-                      : apiCode === "kyc_required"
-                        ? "kyc_required"
-                        : apiCode === "offramp_rejected"
-                          ? "offramp_rejected"
-                        : apiCode === "anchor_auth_required"
-                          ? "anchor_auth_required"
-                        : apiCode === "destination_cannot_receive"
-                          ? "destination_cannot_receive"
-                          : apiCode === "payment_rejected"
-                            ? "payment_rejected"
-                            : "server_error";
+    const code: ApiErrorCode = classifyError(res.status, body);
     const detail = typeof message === "string" ? message : (apiCode ?? res.statusText);
     throw new CheckoutError(code, res.status, detail, missingFields, details);
   }
@@ -521,6 +587,9 @@ export const api = {
     ),
 
 
+  getCashOutTransfer: (id: string) =>
+    http<{ transfer: WithdrawTransfer }>(`/links/${id}/cash-out/transfer`),
+
   exportCsv: (from?: string, to?: string): Promise<Blob> => {
     const params = new URLSearchParams();
     if (from) params.set("from", from);
@@ -542,7 +611,15 @@ export const api = {
     }),
 
   logout: () => http<{ ok: true }>("/auth/logout", { method: "POST" }).finally(() => setSessionToken(null)),
-  getKyc: () => http<KycView>("/seller/kyc"),
+  getKyc: (opts?: { refresh?: boolean }) =>
+    http<KycView>(`/seller/kyc${opts?.refresh ? "?refresh=1" : ""}`),
+  getProfile: () => http<ProfileResponse>("/seller/profile").then(toProfileView),
+  /** Sends only the given fields; the API rejects empty values with 422 `invalid_fields`. */
+  saveProfile: (fields: Record<string, string>) =>
+    http<ProfileResponse>("/seller/profile", { method: "PUT", body: JSON.stringify(fields) }).then(toProfileView),
+  /** Right to erasure (NDPA). Session auth only; `confirm` must be the seller's wallet address. */
+  eraseProfile: (confirm: string) =>
+    http<ErasureResult>("/seller/profile", { method: "DELETE", body: JSON.stringify({ confirm }) }),
   getDisclosures: () => http<KycDisclosure[]>("/seller/kyc/disclosures"),
   deleteAnchorKyc: (anchorDomain: string) => http<{ anchorDomain: string; anchorResult: "deleted" | "not_found"; localDataErased: true }>(
     `/seller/kyc/disclosures/${encodeURIComponent(anchorDomain)}`, { method: "DELETE" },

@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
-import { AnchorAuthRequiredError, OffRampJobNotFoundError, type AnchorCustomer, type KycPort, type OffRampInitiation, type RailPort, type WithdrawTransfer } from "@checkout/core";
+import { describe, expect, it, vi } from "vitest";
+import { AnchorAuthRequiredError, OffRampJobNotFoundError, type AnchorCustomer, type KycPort, type OffRampInitiation, type OffRampPort, type RailPort, type WithdrawTransfer } from "@checkout/core";
 import { MockAnchorOffRamp, Sep6ValidationError } from "@checkout/offramp";
 import type { StellarConfig } from "@checkout/stellar";
 import { LinkService } from "../src/services/link-service";
+import { CircuitBreakerOffRamp } from "../src/services/circuit-breaker";
 import {
   AlwaysAcceptedKyc,
   FakeLinkRepository,
@@ -36,7 +37,7 @@ const UNUSED_RAIL: RailPort = {
 
 function makeService(opts: {
   links: FakeLinkRepository;
-  offramp: ScriptedOffRamp | MockAnchorOffRamp;
+  offramp: OffRampPort;
   offrampState: FakeOffRampStateRepository;
   webhooks?: FakeWebhookRepository;
   kyc?: KycPort;
@@ -136,18 +137,111 @@ describe("LinkService.pollCashOuts", () => {
     expect(links.get("lnk_1")?.offrampStatus).toBe("failed");
   });
 
-  it("leaves the link pending on a transient (non-typed) error, to retry next tick", async () => {
+  it("leaves the link pending on a transient error, records classified error on offrampState, and clears it on success", async () => {
+    const offrampState = new FakeOffRampStateRepository();
+    await offrampState.saveJob({
+      jobId: "job_1",
+      linkId: "lnk_1",
+      anchor: "mock",
+      status: "pending",
+      externalStatus: null,
+      targetCurrency: "NGN",
+      targetAmount: "16500",
+      rate: "1650",
+      sellerId: "sel_1",
+      account: "GSELLER",
+      createdAt: 1000,
+      updatedAt: 1000,
+      lastError: null,
+      lastPollError: null,
+      lastPollErrorAt: null,
+      lastPollReason: null,
+      transferNotifiedAt: null,
+    });
     const links = new FakeLinkRepository([
       makeLink({ status: "offramp_pending", offrampJobId: "job_1", offrampStatus: "pending" }),
     ]);
     const offramp = new ScriptedOffRamp();
     offramp.statusImpl = async () => {
-      throw new Error("ECONNRESET");
+      throw new Error("ECONNRESET: failed to connect to anchor.stellar.org/sep6");
     };
 
-    await makeService({ links, offramp, offrampState: new FakeOffRampStateRepository() }).pollCashOuts();
+    const service = makeService({ links, offramp, offrampState });
+    await service.pollCashOuts();
 
     expect(links.get("lnk_1")?.status).toBe("offramp_pending");
+    const jobAfterError = await offrampState.getJob("job_1");
+    expect(jobAfterError?.lastPollReason).toBe("anchor_unreachable");
+    expect(jobAfterError?.lastPollError).toBe("The anchor could not be reached. We will keep trying.");
+    expect(jobAfterError?.lastPollErrorAt).toBeGreaterThan(0);
+
+    const status = await service.getOfframpPollStatus(links.get("lnk_1")!);
+    expect(status).toEqual({
+      reason: "anchor_unreachable",
+      message: "The anchor could not be reached. We will keep trying.",
+      at: jobAfterError!.lastPollErrorAt!,
+    });
+
+    // Now make statusImpl succeed
+    offramp.statusImpl = async (jobId) => ({
+      jobId,
+      linkId: "lnk_1",
+      status: "settled",
+      targetCurrency: "NGN",
+      targetAmount: "16500",
+      rate: "1650",
+    });
+
+    const realNow = Date.now.bind(Date);
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10_000);
+    await service.pollCashOuts();
+    nowSpy.mockRestore();
+
+    expect(links.get("lnk_1")?.status).toBe("offramp_settled");
+    const jobAfterSuccess = await offrampState.getJob("job_1");
+    expect(jobAfterSuccess?.lastPollReason).toBeNull();
+    expect(jobAfterSuccess?.lastPollError).toBeNull();
+    expect(jobAfterSuccess?.lastPollErrorAt).toBeNull();
+
+    const statusAfterSettled = await service.getOfframpPollStatus(links.get("lnk_1")!);
+    expect(statusAfterSettled).toBeNull();
+  });
+
+  it("classifies anchor auth required errors accurately", async () => {
+    const offrampState = new FakeOffRampStateRepository();
+    await offrampState.saveJob({
+      jobId: "job_auth",
+      linkId: "lnk_1",
+      anchor: "mock",
+      status: "pending",
+      externalStatus: null,
+      targetCurrency: "NGN",
+      targetAmount: "16500",
+      rate: "1650",
+      sellerId: "sel_1",
+      account: "GSELLER",
+      createdAt: 1000,
+      updatedAt: 1000,
+      lastError: null,
+      lastPollError: null,
+      lastPollErrorAt: null,
+      lastPollReason: null,
+      transferNotifiedAt: null,
+    });
+    const links = new FakeLinkRepository([
+      makeLink({ status: "offramp_pending", offrampJobId: "job_auth", offrampStatus: "pending" }),
+    ]);
+    const offramp = new ScriptedOffRamp();
+    offramp.statusImpl = async () => {
+      throw new AnchorAuthRequiredError("testanchor.stellar.org");
+    };
+
+    const service = makeService({ links, offramp, offrampState });
+    await service.pollCashOuts();
+
+    const job = await offrampState.getJob("job_auth");
+    expect(job?.lastPollReason).toBe("anchor_auth_required");
+    expect(job?.lastPollError).toBe("Anchor session expired or required. Please reconnect your anchor session in settings.");
   });
 
   it("fails a link stuck at offramp_pending with no job id at all (can never resolve)", async () => {
@@ -730,6 +824,24 @@ describe("LinkService cash-out — the seller is the anchor's customer", () => {
     expect(job).toMatchObject({ sellerId: "sel_1", account: "GSELLER" });
   });
 
+  it("checks KYC at the cash-out gate without opting into the status cache", async () => {
+    const links = new FakeLinkRepository([makeLink({ status: "paid" })]);
+    const seenOpts: Array<{ maxAgeMs?: number } | undefined> = [];
+    const kyc = new ScriptedKyc();
+    kyc.statusImpl = async (customer, opts) => {
+      seenOpts.push(opts);
+      return new AlwaysAcceptedKyc().status(customer);
+    };
+    const offrampState = new FakeOffRampStateRepository();
+    const offramp = new MockAnchorOffRamp({ state: offrampState, settleAfterMs: 60_000 });
+    const service = makeService({ links, offramp, offrampState, kyc });
+
+    await service.triggerCashOut("lnk_1", { targetCurrency: "NGN", payoutFields: {} });
+
+    expect(seenOpts.length).toBeGreaterThan(0);
+    for (const opts of seenOpts) expect(opts?.maxAgeMs).toBeUndefined();
+  });
+
   it("answers 403 anchor_auth_required when the seller has not signed in to the anchor", async () => {
     const links = new FakeLinkRepository([makeLink({ status: "paid" })]);
     const kyc = new ScriptedKyc();
@@ -759,6 +871,33 @@ describe("LinkService cash-out — the seller is the anchor's customer", () => {
     await expect(
       service.triggerCashOut("lnk_1", { targetCurrency: "NGN", payoutFields: {} }),
     ).rejects.toMatchObject({ status: 403, message: "anchor_auth_required" });
+  });
+
+  describe("getOfframpPreview with CircuitBreakerOffRamp", () => {
+    it("returns non-null preview when wrapped around MockAnchorOffRamp", async () => {
+      const links = new FakeLinkRepository([makeLink({ status: "paid", amount: "10" })]);
+      const offrampState = new FakeOffRampStateRepository();
+      const inner = new MockAnchorOffRamp({ state: offrampState });
+      const wrapped = new CircuitBreakerOffRamp(inner);
+      const service = makeService({ links, offramp: wrapped, offrampState });
+
+      const preview = await service.getOfframpPreview("lnk_1", "USD");
+      expect(preview).not.toBeNull();
+      expect(preview!.indicative).toBe(true);
+      expect(preview!.sourceAmount).toBe("10");
+      expect(preview!.prices.length).toBeGreaterThan(0);
+    });
+
+    it("returns null preview when wrapped around an adapter lacking indicativePrices", async () => {
+      const links = new FakeLinkRepository([makeLink({ status: "paid", amount: "10.0000000" })]);
+      const offrampState = new FakeOffRampStateRepository();
+      const inner = new ScriptedOffRamp(); // does not have indicativePrices
+      const wrapped = new CircuitBreakerOffRamp(inner);
+      const service = makeService({ links, offramp: wrapped, offrampState });
+
+      const preview = await service.getOfframpPreview("lnk_1", "USD");
+      expect(preview).toBeNull();
+    });
   });
 });
 
@@ -1166,3 +1305,132 @@ describe("LinkService cash-out — anchor rejections", () => {
     ).rejects.toMatchObject({ status: 409, message: "quote_mismatch" });
   });
 });
+
+describe("LinkService.getCashOutTransfer (resume an unsent transfer)", () => {
+  it("returns null for a nonexistent link", async () => {
+    const service = makeService({
+      links: new FakeLinkRepository([]),
+      offramp: new ScriptedOffRamp(),
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    expect(await service.getCashOutTransfer("lnk_unknown")).toBeNull();
+  });
+
+  it("rejects 409 when link status is not offramp_pending", async () => {
+    const links = new FakeLinkRepository([makeLink({ id: "lnk_1", status: "paid" })]);
+    const service = makeService({
+      links,
+      offramp: new ScriptedOffRamp(),
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    await expect(service.getCashOutTransfer("lnk_1")).rejects.toMatchObject({
+      status: 409,
+    });
+  });
+
+  it("returns null if link has no offrampJobId", async () => {
+    const links = new FakeLinkRepository([makeLink({ id: "lnk_1", status: "offramp_pending", offrampJobId: null })]);
+    const service = makeService({
+      links,
+      offramp: new ScriptedOffRamp(),
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    const res = await service.getCashOutTransfer("lnk_1");
+    expect(res).toBeNull();
+  });
+
+  it("returns { transfer } from offramp status", async () => {
+    const links = new FakeLinkRepository([
+      makeLink({ id: "lnk_1", status: "offramp_pending", offrampJobId: "job_123" }),
+    ]);
+    const offramp = new ScriptedOffRamp();
+    offramp.statusImpl = async (jobId) => ({
+      jobId,
+      linkId: "lnk_1",
+      status: "pending",
+      targetCurrency: "NGN",
+      targetAmount: "16500",
+      rate: "1650",
+      transfer: {
+        destination: "GANCHOR",
+        amount: "10",
+        asset: { code: "USDC", issuer: "GISSUER" },
+        memo: "42",
+        memoType: "id",
+      },
+    });
+    const service = makeService({
+      links,
+      offramp,
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    const res = await service.getCashOutTransfer("lnk_1");
+    expect(res).toEqual({
+      destination: "GANCHOR",
+      amount: "10",
+      asset: { code: "USDC", issuer: "GISSUER" },
+      memo: "42",
+      memoType: "id",
+    });
+  });
+
+  it("maps AnchorAuthRequiredError to 403 anchor_auth_required", async () => {
+    const links = new FakeLinkRepository([
+      makeLink({ id: "lnk_1", status: "offramp_pending", offrampJobId: "job_123" }),
+    ]);
+    const offramp = new ScriptedOffRamp();
+    offramp.statusImpl = async () => {
+      throw new AnchorAuthRequiredError("anchor.example");
+    };
+    const service = makeService({
+      links,
+      offramp,
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    await expect(service.getCashOutTransfer("lnk_1")).rejects.toMatchObject({
+      status: 403,
+      message: "anchor_auth_required",
+    });
+  });
+
+  it("falls back to the stored instructions when the anchor cannot be reached", async () => {
+    const links = new FakeLinkRepository([
+      makeLink({ id: "lnk_1", status: "offramp_pending", offrampJobId: "job_123" }),
+    ]);
+    const offrampState = new FakeOffRampStateRepository();
+    const stored = {
+      destination: "GANCHOR",
+      amount: "10",
+      asset: { code: "USDC", issuer: "GISSUER" },
+      memo: "42",
+      memoType: "id" as const,
+    };
+    await offrampState.saveJob({
+      jobId: "job_123",
+      linkId: "lnk_1",
+      anchor: "testanchor",
+      status: "awaiting_transfer",
+      externalStatus: "pending_user_transfer_start",
+      targetCurrency: "NGN",
+      targetAmount: "16500",
+      rate: "1650",
+      sellerId: "sel_1",
+      account: "GSELLER",
+      createdAt: 1000,
+      updatedAt: 1000,
+      lastError: null,
+      lastPollError: null,
+      lastPollErrorAt: null,
+      lastPollReason: null,
+      transferNotifiedAt: null,
+      transfer: stored,
+    });
+    const offramp = new ScriptedOffRamp();
+    offramp.statusImpl = async () => {
+      throw new Error("ECONNRESET");
+    };
+    const service = makeService({ links, offramp, offrampState });
+    expect(await service.getCashOutTransfer("lnk_1")).toEqual(stored);
+  });
+});
+

@@ -277,6 +277,7 @@ export interface TestContainer extends Container {
   links: DrizzleLinkRepository;
   sellers: DrizzleSellerRepository;
   webhooks: DrizzleWebhookRepository;
+  offrampState: DrizzleOffRampStateRepository;
   state: DrizzleWatcherStateRepository;
   rail: FakeRailPort;
   watcher: FakeWatcherPort;
@@ -327,6 +328,7 @@ export async function createTestContainer(): Promise<TestContainer> {
     sellers: repos.sellers,
     webhooks: repos.webhooks,
     apiKeys,
+    offrampState,
     state: repos.state,
     rail,
     watcher,
@@ -341,6 +343,7 @@ export async function createTestContainer(): Promise<TestContainer> {
       async revoke(sellerId: string, anchorDomain: string) { },
     } as unknown as Container["kycConsents"],
     anchorDomain: "testanchor.stellar.org",
+    kycRepo: null,
     anchorAuth: null,
     deleteAnchorCustomer: null,
     telemetry,

@@ -366,6 +366,7 @@ class FakeSellerRepoForAnchor {
 
 class FakeWebhookRepoForAnchor implements WebhookRepository {
   stored: Webhook[] = [];
+  enqueued: { event: string; linkId: string }[] = [];
   async create(input: { sellerId: string; url: string; secret: string }): Promise<Webhook> {
     const w: Webhook = {
       id: "whk_x",
@@ -407,6 +408,7 @@ class FakeWebhookRepoForAnchor implements WebhookRepository {
     return null;
   }
   async enqueue(e: { id: string; webhookId: string; linkId: string; event: string; payload: string; nextAttemptAt: number; createdAt: number }) {
+    this.enqueued.push({ event: e.event, linkId: e.linkId });
     return { ...e, attempts: 0, status: "pending" as const, lastStatusCode: null, lastError: null, updatedAt: e.createdAt };
   }
   async claimDue(): Promise<never[]> {
@@ -458,7 +460,7 @@ class FakeOffRampStateForAnchor implements OffRampStateRepository {
   }
   async updateJob(
     jobId: string,
-    patch: Partial<Pick<StoredOffRampJob, "targetAmount" | "status" | "externalStatus" | "lastError" | "transferNotifiedAt">>,
+    patch: Partial<Pick<StoredOffRampJob, "targetAmount" | "status" | "externalStatus" | "lastError" | "transfer" | "transferNotifiedAt">>,
   ): Promise<void> {
     const job = this.jobs.get(jobId);
     if (!job) return;
@@ -652,7 +654,9 @@ describe("LinkService with AnchorHealth", () => {
     });
     expect(res.status).toBe(502);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toContain("Off-ramp error");
+    // A code clients can branch on: the upstream's own message is logged,
+    // never returned (issue 4.36).
+    expect(body.error).toBe("anchor_error");
   });
 
   it("healthSnapshot reflects the breaker state and is exposed on the service", async () => {
@@ -865,6 +869,7 @@ describe("LinkService.pollCashOuts attribution", () => {
     await service.pollCashOuts();
     expect((await repo.findById("lnk_3"))!.status).toBe("offramp_failed");
     expect(service.lastPollErrorFor("lnk_3")).toBeNull();
+    expect(webhooks.enqueued).toContainEqual({ event: "offramp.failed", linkId: "lnk_3" });
   });
 
   it("backs off per job after consecutive poll failures (AC3 — does not hammer a downed anchor)", async () => {
